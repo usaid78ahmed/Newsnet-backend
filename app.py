@@ -19,15 +19,20 @@ CORS(app, resources={
 })
 
 openrouter_client = OpenAI(
-    api_key= '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',
+    api_key= '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',
     base_url="https://openrouter.ai/api/v1"
 )
 
+#gemini-2.5-pro-exp-03-25:free
+#'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'
 # Set the model
-openrouter_model = "openrouter/optimus-alpha"
+openrouter_model = "google/gemini-2.0-flash-exp:free"
 
 # Explicitly handle OPTIONS requests (preflight requests)
 @app.route('/query', methods=['OPTIONS'])
+@app.route('/get_seed_articles', methods=['OPTIONS'])
+@app.route('/get_neighbor_articles', methods=['OPTIONS'])
+@app.route('/generate_summary', methods=['OPTIONS'])
 def handle_options():
     response = jsonify({'status': 'ok'})
     response.headers.add('Access-Control-Allow-Origin', '*')
@@ -181,6 +186,88 @@ def extract_important_triplets(G, important_entities, max_triplets=20):
     
     return important_triplets
 
+@app.route('/get_seed_articles', methods=['POST'])
+def get_seed_articles():
+    data = request.get_json()
+    query = data.get("query", "")
+    n_seed = data.get("n_seed", 5)  # Number of seed articles to retrieve.
+
+    if not query:
+        return jsonify({"error": "No query provided."}), 400
+
+    # 1. Embed the query and retrieve seed article IDs from FAISS.
+    q_emb = embed_query_fn(query, index).reshape(1, -1)
+    distances, seed_ids = index.search(q_emb, n_seed)
+    seed_ids = [str(x) for x in seed_ids[0]]  # Convert IDs to strings
+
+    # 2. Query MongoDB for the full article details.
+    seed_articles_data = []
+    for doc in articles_collection.find({"article_id": {"$in": seed_ids}}, {"_id": 0}):
+        # Add the article_id to each document for reference
+        doc["id"] = doc["article_id"]
+        seed_articles_data.append(doc)
+
+    return jsonify({
+        "seed_articles": seed_articles_data
+    })
+
+
+@app.route('/get_neighbor_articles', methods=['POST'])
+def get_neighbor_articles():
+    data = request.get_json()
+    seed_id = data.get("seed_id")
+    query = data.get("query", "")  # Original query to compute similarity
+    threshold = data.get("threshold", 0.5)  # Similarity threshold
+
+    if not seed_id:
+        return jsonify({"error": "No seed article ID provided."}), 400
+
+    # 1. Get neighbors for this seed article
+    seed_doc = neighbors_collection.find_one(
+        {"node_id": seed_id}, {"_id": 0, "neighbors": 1}
+    )
+    
+    if not seed_doc:
+        return jsonify({"error": f"No neighbors found for seed article with ID {seed_id}"}), 404
+        
+    neighbor_ids = seed_doc.get("neighbors", [])
+    
+    # 2. If we have a query, compute similarity for filtering
+    if query:
+        q_emb = embed_query_fn(query, index).reshape(1, -1)
+        q_vec = q_emb.flatten()
+    
+    # 3. Get neighbor article details
+    neighbor_articles = []
+    for doc in articles_collection.find({"article_id": {"$in": neighbor_ids}}, {"_id": 0}):
+        # If we have a query, compute similarity
+        if query:
+            article_id = doc["article_id"]
+            try:
+                article_emb = index.index.reconstruct(int(article_id))
+                sim = compute_cosine_similarity(q_vec, article_emb)
+                doc["similarity"] = float(sim)
+                
+                # Only add if above threshold
+                if sim >= threshold:
+                    doc["id"] = article_id  # Add ID for frontend reference
+                    neighbor_articles.append(doc)
+            except:
+                # Skip if error in reconstruction
+                continue
+        else:
+            # If no query, just add all neighbors
+            doc["id"] = doc["article_id"]
+            neighbor_articles.append(doc)
+    
+    # Sort by similarity if available
+    if query:
+        neighbor_articles.sort(key=lambda x: x.get("similarity", 0), reverse=True)
+        
+    return jsonify({
+        "neighbor_articles": neighbor_articles
+    })
+
 @app.route('/query', methods=['POST'])
 def query_api():
     data = request.get_json()
@@ -257,6 +344,94 @@ def query_api():
         }
         yield json.dumps(seed_info, cls=NumpyEncoder) + '\n'
         
+        
+        try:
+            # Create a streaming response from OpenRouter
+            stream = openrouter_client.chat.completions.create(
+                model=openrouter_model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that summarizes news articles. Format your response with Markdown, using # for main headings, ## for subheadings, **bold text** for emphasis, bullet points with * or -, and numbered lists where appropriate. Make your response visually structured and easy to read."},
+                    {"role": "user", "content": formatted_articles}
+                ],
+                stream=True  # Enable streaming
+            )
+            
+            response_text = ""
+            
+            # Process the streaming response
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    text_fragment = chunk.choices[0].delta.content
+                    response_text += text_fragment
+                    
+                    # Send the updated text to the client
+                    yield json.dumps({
+                        "response": text_fragment,
+                        "done": False
+                    }) + "\n"
+            
+            # Signal that we're done
+            yield json.dumps({
+                "done": True,
+                "final_response": response_text
+            }) + "\n"
+                
+        except Exception as e:
+            # Handle errors
+            yield json.dumps({
+                "error": str(e),
+                "done": True
+            }) + "\n"
+
+    return Response(stream_with_context(generate()), mimetype='application/x-ndjson')
+
+@app.route('/generate_summary', methods=['POST'])
+def generate_summary():
+    data = request.get_json()
+    seed_article_id = data.get("seed_article_id")
+    neighbor_article_ids = data.get("neighbor_article_ids", [])
+    
+    if not seed_article_id:
+        return jsonify({"error": "No seed article ID provided."}), 400
+    
+    # 1. Get article details
+    all_ids = [seed_article_id] + neighbor_article_ids
+    
+    # Get all article details
+    article_details = {}
+    for doc in articles_collection.find({"article_id": {"$in": all_ids}}, {"_id": 0}):
+        article_details[doc["article_id"]] = doc
+    
+    # 2. Organize articles
+    seed_article = article_details.get(seed_article_id)
+    if not seed_article:
+        return jsonify({"error": f"Seed article with ID {seed_article_id} not found"}), 404
+    
+    seed_articles = [seed_article]
+    neighbor_articles = [article_details.get(nid) for nid in neighbor_article_ids if nid in article_details]
+    
+    # 3. Format articles for the LLM
+    formatted_articles = format_articles_for_llama(seed_articles, neighbor_articles)
+    
+    # 4. Get entity relationships
+    entity_relationships = get_entity_relationships_for_articles(all_ids)
+    
+    # 5. Build entity graph
+    entity_graph = build_entity_graph(entity_relationships)
+    
+    # 6. Extract important entities and triplets
+    important_entities = get_most_connected_entities(entity_graph, top_n=8)
+    important_triplets = extract_important_triplets(entity_graph, important_entities, max_triplets=50)
+    
+    def generate():
+        # First yield the initial metadata
+        seed_info = {
+            "seed_articles": seed_articles,
+            "neighbor_articles": neighbor_articles,
+            "entity_triplets": important_triplets,
+            "important_entities": [entity for entity, _ in important_entities]
+        }
+        yield json.dumps(seed_info, cls=NumpyEncoder) + '\n'
         
         try:
             # Create a streaming response from OpenRouter
