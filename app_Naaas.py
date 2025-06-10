@@ -108,12 +108,12 @@ def format_titles_query_prompt(seed_article, query, titles, neighbor_articles):
 # Initialize OpenAI client with OpenRouter
 from openai import OpenAI
 client = OpenAI(
-    api_key='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',
+    api_key='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',
     base_url="https://openrouter.ai/api/v1"
 )
 
 # Set the model
-model = "openrouter/optimus-alpha"
+model = "google/gemini-2.0-flash-exp:free"
 
 @app.route('/query_with_titles', methods=['POST'])
 def query_with_titles():

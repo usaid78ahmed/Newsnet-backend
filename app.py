@@ -19,7 +19,7 @@ CORS(app, resources={
 })
 
 openrouter_client = OpenAI(
-    api_key= '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',
+    api_key= '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',
     base_url="https://openrouter.ai/api/v1"
 )
 
@@ -77,7 +77,7 @@ neighbors_collection = db["multihop_neighbors"]
 articles_collection = db["id_to_article"]
 entity_relationships_collection = db["entity_relationships"]
 
-def format_articles_for_llama(seed_articles, neighboring):
+def format_articles_for_llama(seed_articles, neighboring, user_query=""):
     """
     Format retrieved articles as input for Llama3 with a system prompt.
     """
@@ -94,8 +94,13 @@ def format_articles_for_llama(seed_articles, neighboring):
         "- Use **bold text** for emphasis\n"
         "- Use bullet points (- or *) for lists\n"
         "- Use numbered lists where appropriate\n"
-        "Here are the articles:\n\n"
     )
+
+    # Add user query if provided
+    if user_query:
+        system_prompt += f"FOCUS ON ANSWERING THIS SPECIFIC QUERY: {user_query}\n\n"
+    
+    system_prompt += "Here are the articles:\n\n"
 
     formatted_text = system_prompt
 
@@ -390,6 +395,7 @@ def generate_summary():
     data = request.get_json()
     seed_article_id = data.get("seed_article_id")
     neighbor_article_ids = data.get("neighbor_article_ids", [])
+    user_query = data.get("query", "")  # Get the user's query from the request
     
     if not seed_article_id:
         return jsonify({"error": "No seed article ID provided."}), 400
@@ -410,8 +416,8 @@ def generate_summary():
     seed_articles = [seed_article]
     neighbor_articles = [article_details.get(nid) for nid in neighbor_article_ids if nid in article_details]
     
-    # 3. Format articles for the LLM
-    formatted_articles = format_articles_for_llama(seed_articles, neighbor_articles)
+    # 3. Format articles for the LLM, passing the user query
+    formatted_articles = format_articles_for_llama(seed_articles, neighbor_articles, user_query)
     
     # 4. Get entity relationships
     entity_relationships = get_entity_relationships_for_articles(all_ids)
@@ -429,16 +435,23 @@ def generate_summary():
             "seed_articles": seed_articles,
             "neighbor_articles": neighbor_articles,
             "entity_triplets": important_triplets,
-            "important_entities": [entity for entity, _ in important_entities]
+            "important_entities": [entity for entity, _ in important_entities],
+            "user_query": user_query  # Include the user query in metadata
         }
         yield json.dumps(seed_info, cls=NumpyEncoder) + '\n'
         
         try:
+            # Create system prompt that includes instruction about the query if provided
+            system_prompt = "You are a helpful assistant that summarizes news articles. Format your response with Markdown, using # for main headings, ## for subheadings, **bold text** for emphasis, bullet points with * or -, and numbered lists where appropriate. Make your response visually structured and easy to read."
+            
+            if user_query:
+                system_prompt += f" Focus specifically on addressing the user's query: '{user_query}' based on the provided articles."
+            
             # Create a streaming response from OpenRouter
             stream = openrouter_client.chat.completions.create(
                 model=openrouter_model,
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant that summarizes news articles. Format your response with Markdown, using # for main headings, ## for subheadings, **bold text** for emphasis, bullet points with * or -, and numbered lists where appropriate. Make your response visually structured and easy to read."},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": formatted_articles}
                 ],
                 stream=True  # Enable streaming
@@ -472,7 +485,6 @@ def generate_summary():
             }) + "\n"
 
     return Response(stream_with_context(generate()), mimetype='application/x-ndjson')
-
 @app.route('/dummy_stream', methods=['GET'])
 def dummy_stream():
     def generate():
@@ -512,7 +524,7 @@ def hello_model():
     return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5001, debug=True)
 # if __name__ == '__main__':
 #     app.run(debug=True)
 
