@@ -19,14 +19,14 @@ CORS(app, resources={
 })
 
 openrouter_client = OpenAI(
-    api_key= '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',
+    api_key= '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',
     base_url="https://openrouter.ai/api/v1"
 )
 
 #gemini-2.5-pro-exp-03-25:free
 #'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'
 # Set the model
-openrouter_model = "google/gemini-2.0-flash-exp:free"
+openrouter_model = "deepseek/deepseek-chat-v3-0324:free"
 
 # Explicitly handle OPTIONS requests (preflight requests)
 @app.route('/query', methods=['OPTIONS'])
@@ -300,6 +300,7 @@ def query_api():
         for neighbor in doc.get("neighbors", []):
             neighbor_ids.add(neighbor)
     neighbor_ids = list(neighbor_ids)
+    neighbor_ids = neighbor_ids[:100]
 
     # 4. Query MongoDB for full article details (both seed and neighbor articles).
     all_ids = seed_ids + neighbor_ids
